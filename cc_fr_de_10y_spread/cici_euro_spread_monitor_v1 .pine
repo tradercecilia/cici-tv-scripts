@@ -1,0 +1,644 @@
+//@version=6
+// SPDX-License-Identifier: MIT
+// CC France-Germany 10Y Spread Monitor v1.5.1 | 2026-10-23
+// Author: Cici / Cecilia
+// Spread (bp) = (France 10Y yield - Germany 10Y yield) * 100.
+// Supports standard 1-60 minute charts; the observation window must be a multiple of the chart interval.
+// Tables/markers use confirmed bar closes and the source bar's opening-time label.
+// Intrabar alert snapshots are separate; actual trigger times and values are in TradingView's Alerts Log.
+// Historical daily extremes are envelope proxies, not synchronized spread OHLC; coverage can vary.
+// Dashed gap bridges are visual only. This indicator does not infer news causes or issue trade instructions.
+//
+// MIT License: Copyright (c) 2026 Cici / Cecilia.
+// Permission is hereby granted, free of charge, to any person obtaining a copy of
+// this software and associated documentation files (the "Software"), to deal in
+// the Software without restriction, including without limitation the rights to
+// use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+// of the Software, and to permit persons to whom the Software is furnished to do
+// so, subject to inclusion of this copyright and permission notice.
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO MERCHANTABILITY, FITNESS FOR A PARTICULAR
+// PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+// BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY ARISING FROM THE SOFTWARE.
+
+indicator("CC France-Germany 10Y Spread Monitor v1.5.1", shorttitle="CC FR-DE 10Y", overlay=false, precision=2, max_bars_back=5000, max_labels_count=20, max_lines_count=400, dynamic_requests=true)
+
+string G_DATA = "01 · 数据与周期"
+string frSymbol = input.symbol("TVC:FR10Y", "法国10年收益率", group=G_DATA)
+string deSymbol = input.symbol("TVC:DE10Y", "德国10年收益率", group=G_DATA)
+bool fxFollowChart = input.bool(true, "汇率跟随主图（主图须为EUR/USD）", group=G_DATA, tooltip="开启后直接使用主图原始OHLC，与主图报价源一致；关闭后使用下方自定义汇率。")
+string fxSymbol = input.symbol("FX:EURUSD", "自定义对照汇率", group=G_DATA)
+string effectiveFxSymbol = fxFollowChart ? syminfo.tickerid : fxSymbol
+int horizonMins = input.int(60, "变化观察窗口（分钟）", minval=15, maxval=1440, group=G_DATA)
+int historyStart = input.time(timestamp("01 Jan 1999 00:00 +0000"), "历史目标起点", group=G_DATA)
+string displayZone = input.string("Asia/Shanghai", "记录时区（IANA名称）", group=G_DATA)
+
+string G_VOL = "02 · 变化异常"
+bool enableVelocity = input.bool(true, "启用异常扩大／收窄", group=G_VOL)
+int baselineN = input.int(240, "基线有效样本数", minval=30, maxval=2000, group=G_VOL)
+float zThreshold = input.float(3.0, "异常倍数 K", minval=1.0, step=0.1, group=G_VOL)
+float minMoveBp = input.float(1.0, "最小绝对变化（bp）", minval=0.0, step=0.1, group=G_VOL)
+float sigmaFloor = input.float(0.10, "波动率下限（bp）", minval=0.01, step=0.01, group=G_VOL, tooltip="避免几乎无波动时分母趋近于零；试运行默认值，并非优化结果。")
+float flatBp = input.float(0.30, "收益率基本不动容差（bp）", minval=0.0, step=0.05, group=G_VOL)
+
+string G_RECORD = "03 · 历史极值"
+bool enableRecords = input.bool(true, "启用历史高低位突破", group=G_RECORD)
+int minRecordDays = input.int(20, "被突破高低点的最小历史间隔", minval=1, maxval=5000, group=G_RECORD, tooltip="按有效日样本计数。阶段突破必须严格越过所列日期的高/低点，且该点距今至少达到此间隔；全部可用历史纪录不受极值年龄限制，但要求足够日样本。")
+float recordStepBp = input.float(0.10, "延续突破最小步长（bp）", minval=0.01, step=0.01, group=G_RECORD)
+
+string G_EVENT = "04 · 记录与通知"
+int groupHours = input.int(8, "同类同方向提醒间隔（小时）", minval=1, maxval=72, group=G_EVENT)
+int showCount = input.int(5, "显示最近异常次数", options=[3, 5], group=G_EVENT)
+int replayBars = input.int(1500, "最近事件回算根数", minval=200, maxval=3000, group=G_EVENT, tooltip="长期历史参照单独加载。这里仅限制最近事件的回算范围，以控制Pine运行时间。")
+bool sendAlerts = input.bool(true, "允许发送实时提醒", group=G_EVENT)
+string messageFormat = input.string("中文文本", "消息格式", options=["中文文本", "JSON"], group=G_EVENT, tooltip="Webhook接程序时可选JSON；App/邮件通常选中文文本。通知渠道在TV创建提醒时设置。")
+
+string G_VIEW = "05 · 显示"
+bool showSummary = input.bool(true, "主图显示当前状态表格", group=G_VIEW)
+bool showLog = input.bool(true, "副图显示最近事件表格", group=G_VIEW)
+bool showBands = input.bool(true, "显示变化范围映射边界", group=G_VIEW)
+bool showMarks = input.bool(true, "显示最近事件标记", group=G_VIEW)
+string summaryPos = input.string("右上", "主图表格位置", options=["右上", "左上", "右下", "左下"], group=G_VIEW)
+string logPos = input.string("右上", "副图记录位置", options=["右上", "左上", "右下", "左下"], group=G_VIEW)
+string summaryFontChoice = input.string("小", "主图表格字号", options=["小", "正常", "大"], group=G_VIEW)
+string logFontChoice = input.string("正常", "副图表格字号", options=["小", "正常", "大"], group=G_VIEW)
+float timeColumnWidth = input.float(10.0, "记录表时间列宽（图表%）", minval=7.0, maxval=20.0, step=0.5, group=G_VIEW, tooltip="时间列独立定宽，避免长标题或文字把它撑宽；窄屏或大字号时可适当增加。")
+int panelTransparency = input.int(4, "表格背景透明度", minval=0, maxval=90, group=G_VIEW)
+color spreadColor = input.color(color.rgb(240, 182, 215), "利差颜色", group=G_VIEW)
+bool useThemeBackdrop = input.bool(true, "副图使用深海军蓝背景", group=G_VIEW)
+bool showGapBridges = input.bool(true, "缺报区间用细虚线连接", group=G_VIEW, tooltip="连接前后已取得的有效报价端点；缺报期间的斜率仅是示意，不参与利差、波动或提醒计算。尚无后端报价时不预测走势。")
+int gapBridgeLimit = input.int(200, "保留缺报虚线段数", minval=20, maxval=400, group=G_VIEW)
+
+// 低饱和深色主题；强信号使用粉色/紫色文字及局部底色。
+color themeNavy = color.rgb(13, 10, 31)
+color themePink = color.rgb(244, 190, 219)
+color themeMagenta = color.rgb(237, 112, 197)
+color themeLavender = color.rgb(181, 173, 255)
+color themeBlue = color.rgb(157, 178, 252)
+bgcolor(useThemeBackdrop ? themeNavy : na, title="深海军蓝底色")
+
+float chartSeconds = timeframe.in_seconds()
+string closeBasis = chartSeconds == 3600 ? "以小时收盘价为准" : "以" + timeframe.period + "分钟收盘价为准"
+string recordHelp = "具体触发时间和历史从警报日志中查看，需在顶部工具栏开启警报。\n创建警报时选择本指标 → 任何 alert() 函数调用，并开启指标参数中的允许发送实时提醒。\n表格仅按已收盘K线回算，时间为该根K线的标签；不代表盘中首次触发时刻。\n盘中触发后收盘恢复的警报，可能不出现在本表中。记录时区：" + displayZone + "。"
+int hBars = int(math.round(horizonMins * 60.0 / chartSeconds))
+if barstate.isfirst
+    if not timeframe.isminutes or chartSeconds > 3600
+        runtime.error("请在1至60分钟的普通K线图上使用本指标；建议1小时EUR/USD图。")
+    if horizonMins * 60 < chartSeconds or (horizonMins * 60) % int(chartSeconds) != 0
+        runtime.error("变化观察窗口必须不小于图表周期，且是图表周期的整数倍。")
+
+f_day(int t) =>
+    na(t) ? int(na) : timestamp("Etc/UTC", year(t, "Etc/UTC"), month(t, "Etc/UTC"), dayofmonth(t, "Etc/UTC"), 0, 0)
+
+f_date(int t) =>
+    na(t) ? "—" : str.format_time(t, "yyyy-MM-dd", "Etc/UTC")
+
+f_num(float x) =>
+    na(x) ? "—" : str.tostring(x, "0.00")
+
+f_signed(float x) =>
+    na(x) ? "—" : (x > 0 ? "+" : "") + str.tostring(x, "0.00")
+
+f_pct(float x) =>
+    na(x) ? "—" : (x > 0 ? "+" : "") + str.tostring(x, "0.000")
+
+f_pos(string x) =>
+    switch x
+        "左上" => position.top_left
+        "右下" => position.bottom_right
+        "左下" => position.bottom_left
+        => position.top_right
+
+f_jsonString(string x) =>
+    string a = str.replace_all(x, "\\", "\\\\")
+    string b = str.replace_all(a, "\"", "\\\"")
+    string c = str.replace_all(b, "\n", "\\n")
+    "\"" + c + "\""
+
+f_jsonNumber(float x) =>
+    na(x) ? "null" : str.tostring(x, "0.000000")
+
+// 在法国日线上下文执行。只收集此前已结束的日样本，避免未来数据泄漏。
+// 仅远端最后一根返回整个集合，避免每根历史分钟K复制数千个日样本。
+f_dailyExport() =>
+    [otherH, otherL, otherT] = request.security(deSymbol, "D", [high[1], low[1], time[1]], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true, calc_bars_count=15000)
+    var array<int> dates = array.new_int()
+    var array<float> highs = array.new_float()
+    var array<float> lows = array.new_float()
+    int aDay = f_day(time[1])
+    int bDay = f_day(otherT)
+    bool paired = not na(aDay) and not na(bDay) and aDay == bDay and aDay >= historyStart and not na(high[1]) and not na(low[1]) and not na(otherH) and not na(otherL)
+    if paired
+        bool isNew = array.size(dates) == 0
+        if not isNew
+            isNew := aDay > array.get(dates, array.size(dates) - 1)
+        if isNew
+            array.push(dates, aDay)
+            array.push(highs, (high[1] - otherL) * 100.0)
+            array.push(lows, (low[1] - otherH) * 100.0)
+    [barstate.islast ? dates : na, barstate.islast ? highs : na, barstate.islast ? lows : na]
+
+[remoteDates, remoteHighs, remoteLows] = request.security(frSymbol, "D", f_dailyExport(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true, calc_bars_count=15000)
+
+// 同周期请求不前视；缺报不沿用上一根报价制造异常。
+[fr, frT] = request.security(frSymbol, timeframe.period, [close, time], gaps=barmerge.gaps_on, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+[de, deT] = request.security(deSymbol, timeframe.period, [close, time], gaps=barmerge.gaps_on, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+[fxRequested, fxOpenRequested, fxTRequested] = request.security(effectiveFxSymbol, timeframe.period, [close, open, time], gaps=barmerge.gaps_on, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+// 跟随主图时直接使用同一根K线的原生数据，不混用另一家EUR/USD报价。
+float fx = fxFollowChart ? close : fxRequested
+float fxOpen = fxFollowChart ? open : fxOpenRequested
+int fxT = fxFollowChart ? time : fxTRequested
+bool valid = not na(fr) and not na(de) and not na(frT) and not na(deT) and frT == deT and frT == time
+float spread = valid ? (fr - de) * 100.0 : na
+bool continuous = math.sum(valid ? 1.0 : 0.0, hBars + 1) == hBars + 1 and not na(time[hBars]) and time - time[hBars] == horizonMins * 60000
+float move = continuous ? spread - spread[hBars] : na
+float frMove = continuous ? (fr - fr[hBars]) * 100.0 : na
+float deMove = continuous ? (de - de[hBars]) * 100.0 : na
+bool fxValid = continuous and not na(fx) and not na(fx[hBars]) and fxT == time and fxT[hBars] == time[hBars] and fx[hBars] != 0
+float fxMove = fxValid ? (fx / fx[hBars] - 1.0) * 100.0 : na
+float fxBarMove = not na(fx) and not na(fxOpen) and fxOpen != 0 and fxT == time ? (fx / fxOpen - 1.0) * 100.0 : na
+int fxWindowStart = fxValid ? time_close[hBars] : int(na)
+int fxWindowEnd = barstate.isrealtime ? timenow : time_close
+// 明确区分观察窗口的收盘到收盘收益，以及来源K线自身的开盘到收盘收益。
+string fxInfo = "汇率报价源 " + effectiveFxSymbol
+fxInfo += fxValid ? "\n汇率比较时段 " + str.format_time(fxWindowStart, "MM-dd HH:mm:ss", displayZone) + " → " + str.format_time(fxWindowEnd, "MM-dd HH:mm:ss", displayZone) + "\n汇率起止价格 " + str.tostring(fx[hBars], "0.00000") + " → " + str.tostring(fx, "0.00000") : "\n汇率比较窗口数据不足"
+fxInfo += "\n来源K线开收涨跌（O/C） " + f_pct(fxBarMove) + "%"
+fxInfo += "\n来源K线开收价格 " + (not na(fxOpen) ? str.tostring(fxOpen, "0.00000") : "—") + " → " + (not na(fx) ? str.tostring(fx, "0.00000") : "—")
+
+float meanMove = ta.sma(move[1], baselineN)
+float sdMove = ta.stdev(move[1], baselineN)
+float effectiveSd = not na(sdMove) ? math.max(sdMove, sigmaFloor) : na
+float zScore = not na(move) and not na(meanMove) and not na(effectiveSd) ? (move - meanMove) / effectiveSd : na
+float upperBand = continuous and not na(effectiveSd) ? spread[hBars] + meanMove + zThreshold * effectiveSd : na
+float lowerBand = continuous and not na(effectiveSd) ? spread[hBars] + meanMove - zThreshold * effectiveSd : na
+
+plot(spread, "法德利差（bp）", color=spreadColor, linewidth=2, style=plot.style_linebr)
+pUpper = plot(showBands ? upperBand : na, "H分钟变化范围上侧映射", color=color.new(themeLavender, 62), style=plot.style_linebr)
+pLower = plot(showBands ? lowerBand : na, "H分钟变化范围下侧映射", color=color.new(themeLavender, 62), style=plot.style_linebr)
+fill(pUpper, pLower, color=color.new(themeLavender, 93), title="近期变化范围")
+
+// 缺报连接只存在于绘图层，不向spread/move/zScore写入模拟值。
+// 普通var在实时更新时回滚，因此同一根K线重算不会永久累积重复线段。
+var int lastValidPlotTime = na
+var float lastValidPlotLevel = na
+var bool plotGapPending = false
+var array<line> gapBridges = array.new<line>()
+if valid
+    bool spansGap = plotGapPending or (not na(lastValidPlotTime) and time - lastValidPlotTime > int(chartSeconds * 1000))
+    if showGapBridges and spansGap and not na(lastValidPlotTime)
+        line bridge = line.new(lastValidPlotTime, lastValidPlotLevel, time, spread, xloc=xloc.bar_time, extend=extend.none, color=color.new(spreadColor, 45), style=line.style_dashed, width=1)
+        array.push(gapBridges, bridge)
+        if array.size(gapBridges) > gapBridgeLimit
+            line.delete(array.shift(gapBridges))
+    lastValidPlotTime := time
+    lastValidPlotLevel := spread
+    plotGapPending := false
+else if not na(lastValidPlotTime)
+    plotGapPending := true
+
+// 长期日样本的范围极值索引；仅在日样本新增时重建。
+varip array<int> dayDates = array.new_int()
+varip array<float> maxTree = array.new_float()
+varip array<float> minTree = array.new_float()
+varip int treeBase = 0
+varip int dailyCount = 0
+varip int firstDay = na
+
+// 返回日期严格早于t的最后一个日样本索引，当前日不会参与自身比较。
+f_dayEnd(array<int> dates, int t) =>
+    int lo = 0
+    int hi = array.size(dates)
+    while lo < hi
+        int mid = int(math.floor((lo + hi) / 2))
+        if array.get(dates, mid) < t
+            lo := mid + 1
+        else
+            hi := mid
+    lo - 1
+
+// 在[0,end]寻找最近一个High>=当前值，或Low<=当前值的日期。
+// 树按右到左检索，不把历史未来日期带入过去的事件回算。
+f_lastTouch(array<float> tree, int base, int end, float value, bool highSide) =>
+    int result = -1
+    if base > 0 and end >= 0 and not na(value)
+        int node = base + end
+        float leaf = array.get(tree, node)
+        bool hit = highSide ? leaf >= value : leaf <= value
+        if hit
+            result := end
+        else
+            bool searching = true
+            while node > 1 and searching
+                if node % 2 == 1
+                    int leftNode = node - 1
+                    float candidate = array.get(tree, leftNode)
+                    bool possible = highSide ? candidate >= value : candidate <= value
+                    if possible
+                        int q = leftNode
+                        while q < base
+                            int rightChild = q * 2 + 1
+                            float rv = array.get(tree, rightChild)
+                            bool rightHit = highSide ? rv >= value : rv <= value
+                            q := rightHit ? rightChild : q * 2
+                        result := q - base
+                        searching := false
+                node := int(math.floor(node / 2))
+    result
+
+// 在确定的闭区间[start,end]查找实际高/低值及对应日期索引。
+// 日期指向已被突破的极值，不再使用尚未突破的阻挡日期或其下一交易日。
+f_rangeExtreme(array<float> tree, int base, int start, int end, bool highSide) =>
+    float best = na
+    int index = -1
+    if base > 0 and start >= 0 and start <= end and end < base
+        int left = base + start
+        int right = base + end
+        while left <= right
+            if left % 2 == 1
+                float candidate = array.get(tree, left)
+                best := na(best) ? candidate : highSide ? math.max(best, candidate) : math.min(best, candidate)
+                left += 1
+            if right % 2 == 0
+                float candidate = array.get(tree, right)
+                best := na(best) ? candidate : highSide ? math.max(best, candidate) : math.min(best, candidate)
+                right -= 1
+            left := int(math.floor(left / 2))
+            right := int(math.floor(right / 2))
+        // 区间内至少有一个best，最右匹配一定在本区间，取并列极值中最近一次。
+        if not na(best)
+            index := f_lastTouch(tree, base, end, best, highSide)
+    [best, index]
+
+f_breakText(bool highSide, int referenceIndex, float referenceValue, bool allHistory) =>
+    string side = highSide ? "新高" : "新低"
+    string prefix = allHistory ? "创可用历史" + side + "；" : ""
+    prefix + (highSide ? "突破" : "跌破") + f_date(array.get(dayDates, referenceIndex)) + (highSide ? "高点（" : "低点（") + f_num(referenceValue) + " bp）"
+
+f_driver(float a, float b) =>
+    string answer = "观察窗口数据不足"
+    if not na(a) and not na(b)
+        int fa = a > flatBp ? 1 : a < -flatBp ? -1 : 0
+        int db = b > flatBp ? 1 : b < -flatBp ? -1 : 0
+        if fa == 1 and db == -1
+            answer := "法升德降 · 双向推动扩大"
+        else if fa == -1 and db == 1
+            answer := "法降德升 · 双向推动收窄"
+        else if fa == 1 and db == 0
+            answer := "法国收益率上升推动扩大"
+        else if fa == 0 and db == -1
+            answer := "德国收益率下降推动扩大"
+        else if fa == -1 and db == 0
+            answer := "法国收益率下降推动收窄"
+        else if fa == 0 and db == 1
+            answer := "德国收益率上升推动收窄"
+        else if fa == 0 and db == 0
+            answer := "两端基本平稳"
+        else if a - b > flatBp
+            answer := fa == 1 ? "两端上涨 · 法国涨幅更大" : "两端下降 · 德国降幅更大"
+        else if a - b < -flatBp
+            answer := fa == 1 ? "两端上涨 · 德国涨幅更大" : "两端下降 · 法国降幅更大"
+        else
+            answer := "两端同向 · 利差变化较小"
+    answer
+
+// 按法德两端的算术组合给出研究方向，不自动认定消息或资金流原因。
+f_fundamental(float a, float b) =>
+    string answer = "观察窗口数据不足，留意后续有效报价。"
+    if not na(a) and not na(b)
+        int fa = a > flatBp ? 1 : a < -flatBp ? -1 : 0
+        int db = b > flatBp ? 1 : b < -flatBp ? -1 : 0
+        if fa == 1 and db == -1
+            answer := "留意欧元区内部避险情绪是否升温，\n法债风险溢价是否上升。"
+        else if fa == -1 and db == 1
+            answer := "留意欧元区内部风险压力是否缓和，\n避险需求是否回落。"
+        else if fa == 1 and db == 0
+            answer := "留意法国预算、政治、评级及发债消息，\n核对法债是否出现单独承压。"
+        else if fa == 0 and db == -1
+            answer := "留意德债避险需求是否增强，\n同时核对欧央行政策预期是否转弱。"
+        else if fa == -1 and db == 0
+            answer := "留意法国财政或政治风险是否缓和，\n法债风险溢价是否回落。"
+        else if fa == 0 and db == 1
+            answer := "留意德债避险需求是否减弱，\n同时核对利率预期及德国发债供给。"
+        else if fa == 0 and db == 0
+            answer := "暂未出现明显分化，留意后续变化。"
+        else if fa == 1 and db == 1
+            answer := a - b > flatBp ? "留意共同的通胀、政策或供给压力，\n进一步核对法债相对风险。" : a - b < -flatBp ? "留意共同的通胀、政策或供给压力，\n核对德国收益率升幅更大的原因。" : "留意共同的通胀、政策或供给压力，\n两端相对分化暂不明显。"
+        else
+            answer := a - b < -flatBp ? "留意法债风险修复，\n同步核对共同利率下行因素。" : a - b > flatBp ? "留意德债避险需求是否增强，\n同步核对共同利率下行因素。" : "留意共同利率下行因素，\n两端相对分化暂不明显。"
+    answer
+
+// 收盘记录与实时提醒分开去重：0..3为收盘记录，4..7为实时提醒。
+// 0=异常扩大,1=异常收窄,2=历史新高,3=历史新低。
+varip array<int> groupStart = array.new_int(8, na)
+varip array<float> groupPeak = array.new_float(8, na)
+// 历史类保存上一次已播报的阻挡日期索引；索引变小代表突破范围向更早历史升级。
+varip array<int> groupReference = array.new_int(8, na)
+varip array<bool> groupActive = array.new_bool(8, false)
+varip array<int> evKey = array.new_int()
+varip array<int> evStart = array.new_int()
+varip array<int> evBarOpen = array.new_int()
+varip array<float> evLevel = array.new_float()
+varip array<string> evTitle = array.new_string()
+varip array<string> evDetail = array.new_string()
+varip array<string> evDescription = array.new_string()
+
+f_kind(int kind) =>
+    switch kind
+        0 => "异常扩大"
+        1 => "异常收窄"
+        2 => "阶段新高"
+        => "阶段新低"
+
+// 表格悬浮卡与中文警报共用字段顺序；仅时间及数值的采集口径不同。
+f_eventFields(string timeLabel, int shownTime, float level, string detail, float delta, float z, float a, float b) =>
+    string cleanDetail = str.replace_all(str.replace_all(str.replace_all(detail, "（合成日线高值口径）", ""), "（合成日线低值口径）", ""), "\n", " · ")
+    string research = str.replace_all(f_fundamental(a, b), "\n", "")
+    timeLabel + "  " + str.format_time(shownTime, "yyyy-MM-dd HH:mm:ss", displayZone) + "\n触发利差  " + f_num(level) + " bp\n" + str.tostring(horizonMins) + "分钟变化  " + f_signed(delta) + " bp\n异常分数  " + f_signed(z) + "\n法国变化  " + f_signed(a) + " bp\n德国变化  " + f_signed(b) + " bp\n收益率贡献  " + f_driver(a, b) + "\n触发说明  " + cleanDetail + "\n基本面关注  " + research
+
+f_event(int kind, bool condition, int ts, int barTs, float level, string detail, int recordTouch, float delta, float z, float a, float b, float r, string fxSnapshot, bool canSend) =>
+    int action = 0
+    int slot = kind + (canSend ? 4 : 0)
+    bool wasActive = array.get(groupActive, slot)
+    if condition
+        int started = array.get(groupStart, slot)
+        float extreme = array.get(groupPeak, slot)
+        bool up = kind == 0 or kind == 2
+        bool improved = na(extreme) or (up ? level >= extreme + recordStepBp : level <= extreme - recordStepBp)
+        bool within = not na(started) and ts - started < groupHours * 3600000
+        int previousReference = array.get(groupReference, slot)
+        bool historyUpgrade = kind >= 2 and not na(started) and not na(previousReference) and recordTouch < previousReference
+        bool create = na(started) or historyUpgrade or (not within and (not wasActive or improved))
+        if create
+            string kindTitle = kind >= 2 and str.contains(detail, "创可用历史") ? (kind == 2 ? "可用记录新高" : "可用记录新低") : f_kind(kind)
+            string heading = (historyUpgrade ? "历史跨度升级 · " : not na(started) and wasActive ? "延续走势 · " : "") + kindTitle
+            array.set(groupStart, slot, ts)
+            array.set(groupReference, slot, recordTouch)
+            array.set(groupPeak, slot, level)
+            if not canSend
+                // 只有历史收盘回算或实时K线确认收盘，才写入副图记录。
+                array.unshift(evKey, kind)
+                array.unshift(evStart, ts)
+                array.unshift(evBarOpen, barTs)
+                array.unshift(evLevel, level)
+                array.unshift(evTitle, heading)
+                array.unshift(evDetail, f_eventFields("触发记录", barTs, level, detail, delta, z, a, b))
+                array.unshift(evDescription, detail)
+                if array.size(evKey) > 5
+                    array.pop(evKey)
+                    array.pop(evStart)
+                    array.pop(evBarOpen)
+                    array.pop(evLevel)
+                    array.pop(evTitle)
+                    array.pop(evDetail)
+                    array.pop(evDescription)
+            action := 1
+            if canSend and sendAlerts
+                string fullDetail = f_eventFields("触发时间", ts, level, detail, delta, z, a, b)
+                string msg = "CC法德十年利差 | " + kindTitle + "\n" + fullDetail
+                if messageFormat == "JSON"
+                    msg := "{\"tool\":\"cici_euro_spread_monitor\",\"version\":\"1.5.1\",\"event\":" + f_jsonString(kindTitle) + ",\"timestamp_ms\":" + str.tostring(ts) + ",\"bar_open_timestamp_ms\":" + str.tostring(barTs) + ",\"time_basis\":\"realtime_observed\",\"timezone\":" + f_jsonString(displayZone) + ",\"fr_symbol\":" + f_jsonString(frSymbol) + ",\"de_symbol\":" + f_jsonString(deSymbol) + ",\"spread_bp\":" + f_jsonNumber(level) + ",\"window_minutes\":" + str.tostring(horizonMins) + ",\"change_bp\":" + f_jsonNumber(delta) + ",\"z_score\":" + f_jsonNumber(z) + ",\"fr_change_bp\":" + f_jsonNumber(a) + ",\"de_change_bp\":" + f_jsonNumber(b) + ",\"trigger_description\":" + f_jsonString(detail) + ",\"yield_contribution\":" + f_jsonString(f_driver(a, b)) + ",\"fundamental_watch\":" + f_jsonString(str.replace_all(f_fundamental(a, b), "\n", "")) + ",\"history_basis\":\"daily_envelope_proxy\",\"detail\":" + f_jsonString(fullDetail) + "}"
+                alert(msg, alert.freq_all)
+        else if improved
+            // 仅跟踪再次播报所需的突破基准，不回写任何已展示的事件快照。
+            array.set(groupPeak, slot, level)
+    array.set(groupActive, slot, condition)
+    action
+
+// 事件观察时间与源K线时间分开：即使K线恰好收在UTC次日00:00，
+// 也仍排除源K线所属日，避免把本日最终高低值用于本日历史信号。
+f_process(int ts, int barTs, float s, float d, float z, float a, float b, float r, string fxSnapshot, bool canSend) =>
+    bool velUp = enableVelocity and not na(d) and not na(z) and d >= minMoveBp and d > 0 and z >= zThreshold
+    bool velDn = enableVelocity and not na(d) and not na(z) and d <= -minMoveBp and d < 0 and z <= -zThreshold
+    int cutoff = f_dayEnd(dayDates, f_day(barTs))
+    int hiTouch = enableRecords and cutoff >= 0 and not na(s) ? f_lastTouch(maxTree, treeBase, cutoff, s, true) : -1
+    int loTouch = enableRecords and cutoff >= 0 and not na(s) ? f_lastTouch(minTree, treeBase, cutoff, s, false) : -1
+    // 尚未突破的阻挡日期只用于定位区间，绝不作为“已突破高点”的日期。
+    [highReference, highReferenceIndex] = f_rangeExtreme(maxTree, treeBase, hiTouch + 1, cutoff, true)
+    [lowReference, lowReferenceIndex] = f_rangeExtreme(minTree, treeBase, loTouch + 1, cutoff, false)
+    int highAge = highReferenceIndex >= 0 ? cutoff - highReferenceIndex : -1
+    int lowAge = lowReferenceIndex >= 0 ? cutoff - lowReferenceIndex : -1
+    // 双重核验：当前值必须严格越过所列实际极值，并满足实际极值本身的历史间隔。
+    bool recUp = enableRecords and not na(s) and highReferenceIndex >= 0 and not na(highReference) and s > highReference and cutoff + 1 >= minRecordDays and (hiTouch < 0 or highAge >= minRecordDays)
+    bool recDn = enableRecords and not na(s) and lowReferenceIndex >= 0 and not na(lowReference) and s < lowReference and cutoff + 1 >= minRecordDays and (loTouch < 0 or lowAge >= minRecordDays)
+    string hiText = recUp ? f_breakText(true, highReferenceIndex, highReference, hiTouch < 0) : ""
+    string loText = recDn ? f_breakText(false, lowReferenceIndex, lowReference, loTouch < 0) : ""
+    int a0 = f_event(0, velUp, ts, barTs, s, "突破近期" + str.tostring(horizonMins) + "分钟变化范围上侧边界", -2, d, z, a, b, r, fxSnapshot, canSend)
+    int a1 = f_event(1, velDn, ts, barTs, s, "跌破近期" + str.tostring(horizonMins) + "分钟变化范围下侧边界", -2, d, z, a, b, r, fxSnapshot, canSend)
+    int a2 = f_event(2, recUp, ts, barTs, s, hiText, hiTouch, d, z, a, b, r, fxSnapshot, canSend)
+    int a3 = f_event(3, recDn, ts, barTs, s, loText, loTouch, d, z, a, b, r, fxSnapshot, canSend)
+    a0 + a1 + a2 + a3
+
+// 仅缓存最近的K线收盘采样；长期日样本独立于这个缓存。
+// sampleT为历史数据可观察的收盘时刻，sampleBarT为源K线起始时刻。
+varip array<int> sampleT = array.new_int()
+varip array<int> sampleBarT = array.new_int()
+varip array<float> sampleS = array.new_float()
+varip array<float> sampleD = array.new_float()
+varip array<float> sampleZ = array.new_float()
+varip array<float> sampleF = array.new_float()
+varip array<float> sampleG = array.new_float()
+varip array<float> sampleR = array.new_float()
+varip array<string> sampleFxInfo = array.new_string()
+if barstate.isnew
+    array.push(sampleT, time_close)
+    array.push(sampleBarT, time)
+    array.push(sampleS, spread)
+    array.push(sampleD, move)
+    array.push(sampleZ, zScore)
+    array.push(sampleF, frMove)
+    array.push(sampleG, deMove)
+    array.push(sampleR, fxMove)
+    array.push(sampleFxInfo, fxInfo)
+    if array.size(sampleT) > replayBars
+        array.shift(sampleT)
+        array.shift(sampleBarT)
+        array.shift(sampleS)
+        array.shift(sampleD)
+        array.shift(sampleZ)
+        array.shift(sampleF)
+        array.shift(sampleG)
+        array.shift(sampleR)
+        array.shift(sampleFxInfo)
+if array.size(sampleT) > 0
+    int tail = array.size(sampleT) - 1
+    array.set(sampleS, tail, spread)
+    array.set(sampleD, tail, move)
+    array.set(sampleZ, tail, zScore)
+    array.set(sampleF, tail, frMove)
+    array.set(sampleG, tail, deMove)
+    array.set(sampleR, tail, fxMove)
+    array.set(sampleFxInfo, tail, fxInfo)
+
+varip bool initialized = false
+varip int lastCloseProcessed = na
+if barstate.islast
+    int nRemote = not na(remoteDates) ? array.size(remoteDates) : 0
+    if nRemote > 0 and nRemote != dailyCount
+        dailyCount := nRemote
+        dayDates := array.copy(remoteDates)
+        firstDay := array.get(dayDates, 0)
+        int b = 1
+        while b < dailyCount
+            b *= 2
+        treeBase := b
+        maxTree := array.new_float(b * 2, -1e20)
+        minTree := array.new_float(b * 2, 1e20)
+        for i = 0 to dailyCount - 1
+            array.set(maxTree, b + i, array.get(remoteHighs, i))
+            array.set(minTree, b + i, array.get(remoteLows, i))
+        int node = b - 1
+        while node >= 1
+            array.set(maxTree, node, math.max(array.get(maxTree, node * 2), array.get(maxTree, node * 2 + 1)))
+            array.set(minTree, node, math.min(array.get(minTree, node * 2), array.get(minTree, node * 2 + 1)))
+            node -= 1
+    if dailyCount > 0
+        if not initialized
+            int replayN = array.size(sampleT) - (barstate.isrealtime ? 1 : 0)
+            if replayN > 0
+                for i = 0 to replayN - 1
+                    f_process(array.get(sampleT, i), array.get(sampleBarT, i), array.get(sampleS, i), array.get(sampleD, i), array.get(sampleZ, i), array.get(sampleF, i), array.get(sampleG, i), array.get(sampleR, i), array.get(sampleFxInfo, i), false)
+                lastCloseProcessed := array.get(sampleT, replayN - 1)
+            // 初次加载以历史收盘状态衔接提醒，随后两套去重状态独立演进。
+            for kind = 0 to 3
+                array.set(groupStart, kind + 4, array.get(groupStart, kind))
+                array.set(groupPeak, kind + 4, array.get(groupPeak, kind))
+                array.set(groupReference, kind + 4, array.get(groupReference, kind))
+                array.set(groupActive, kind + 4, array.get(groupActive, kind))
+            initialized := true
+        if barstate.isrealtime
+            // 实时仍即时触发，不等待K线收盘；来源时区不影响UNIX时间戳。
+            f_process(timenow, time, spread, move, zScore, frMove, deMove, fxMove, fxInfo, true)
+            if barstate.isconfirmed and (na(lastCloseProcessed) or time_close > lastCloseProcessed)
+                // 收盘时独立评估一次，不使用此前实时提醒的触发值或去重状态。
+                f_process(time_close, time, spread, move, zScore, frMove, deMove, fxMove, fxInfo, false)
+                lastCloseProcessed := time_close
+
+// 收盘记录悬浮卡与警报正文共用精简字段，表内时间明确是来源K线标签。
+f_eventHint(int row) =>
+    array.get(evDetail, row)
+
+f_fontSize(string choice) =>
+    choice == "大" ? size.large : choice == "正常" ? size.normal : size.small
+
+f_eventColor(int kind) =>
+    switch kind
+        0 => themePink
+        1 => themeLavender
+        2 => themeMagenta
+        => themeBlue
+
+f_eventBg(int kind) =>
+    switch kind
+        0 => color.new(color.rgb(53, 30, 51), panelTransparency)
+        1 => color.new(color.rgb(36, 30, 63), panelTransparency)
+        2 => color.new(color.rgb(63, 27, 54), panelTransparency)
+        => color.new(color.rgb(27, 34, 59), panelTransparency)
+
+f_eventBadge(int kind, bool fullRecord=false) =>
+    switch kind
+        0 => "↑ 异常扩大"
+        1 => "↓ 异常收窄"
+        2 => fullRecord ? "◆ 记录新高" : "◆ 阶段新高"
+        => fullRecord ? "◆ 记录新低" : "◆ 阶段新低"
+
+string summaryTextSize = f_fontSize(summaryFontChoice)
+string logTextSize = f_fontSize(logFontChoice)
+color panelBg = color.new(color.rgb(19, 15, 39), panelTransparency)
+color panelAlt = color.new(color.rgb(24, 19, 47), panelTransparency)
+color titleBg = color.new(color.rgb(35, 26, 60), panelTransparency)
+color headerBg = color.new(color.rgb(29, 23, 51), panelTransparency)
+color panelFg = color.rgb(239, 235, 247)
+color subdued = color.rgb(159, 151, 181)
+color ruleColor = color.rgb(55, 44, 76)
+var table summary = table.new(f_pos(summaryPos), 2, 9, bgcolor=panelBg, frame_color=ruleColor, frame_width=1, border_width=0, force_overlay=true)
+var table logTable = table.new(f_pos(logPos), 4, 7, bgcolor=panelBg, frame_color=ruleColor, frame_width=1, border_width=0)
+var table footer = table.new(position.bottom_left, 1, 1, bgcolor=color.new(themeNavy, 8))
+var array<label> marks = array.new<label>()
+if barstate.isfirst
+    table.merge_cells(summary, 0, 0, 1, 0)
+    table.merge_cells(logTable, 0, 0, 3, 0)
+
+f_cell(table t, int col, int row, string txt, color ink, string hint, string cellSize, color cellBg, bool strong, string alignment, float cellWidth=0.0) =>
+    table.cell(t, col, row, "  " + txt + "  ", text_color=ink, text_size=cellSize, text_halign=alignment, text_valign=text.align_center, width=cellWidth, bgcolor=cellBg, tooltip=hint, text_formatting=strong ? text.format_bold : text.format_none)
+
+f_summaryCell(int col, int row, string txt, color ink, string hint, color customBg=na, bool strong=false) =>
+    color rowBg = row == 0 ? titleBg : row % 2 == 0 ? panelAlt : panelBg
+    f_cell(summary, col, row, txt, ink, hint, summaryTextSize, na(customBg) ? rowBg : customBg, strong or row == 0, text.align_left)
+
+f_logCell(int col, int row, string txt, color ink, string hint, color customBg=na, bool strong=false) =>
+    color rowBg = row == 0 ? titleBg : row == 1 ? headerBg : row % 2 == 0 ? panelBg : panelAlt
+    string alignment = col == 1 ? text.align_right : text.align_left
+    float columnWidth = col == 0 and row > 0 ? timeColumnWidth : 0.0
+    string cellSize = col == 0 and row == 1 ? size.small : logTextSize
+    f_cell(logTable, col, row, txt, ink, hint, cellSize, na(customBg) ? rowBg : customBg, strong or row <= 1, alignment, columnWidth)
+
+if barstate.islast
+    // 不清除合并标题单元格，逐格覆盖内容，保持标题跨列与首列定宽。
+    // 状态文字与真正的扩大/收窄触发使用同一方向及门槛，避免仅取绝对值时误标。
+    bool liveUp = enableVelocity and not na(move) and not na(zScore) and move >= minMoveBp and move > 0 and zScore >= zThreshold
+    bool liveDn = enableVelocity and not na(move) and not na(zScore) and move <= -minMoveBp and move < 0 and zScore <= -zThreshold
+    string liveState = not valid ? "报价缺失 / 时间未对齐" : na(zScore) ? "观察窗口 / 基线未就绪" : liveUp ? "↑ 异常扩大" : liveDn ? "↓ 异常收窄" : "平稳 · 未触发异常"
+    color statusInk = liveUp ? themePink : liveDn ? themeLavender : subdued
+    color statusBg = liveUp ? f_eventBg(0) : liveDn ? f_eventBg(1) : headerBg
+    if showSummary
+        f_summaryCell(0, 0, "CICI  /  欧元债市观察", themePink, "数值联动观察；不做基本面自动归因。")
+        f_summaryCell(0, 1, "法德利差", subdued, "单位：基点；收益率差乘100。")
+        f_summaryCell(1, 1, f_num(spread) + " bp", themePink, "法国 " + f_num(fr) + "% / 德国 " + f_num(de) + "%", strong=true)
+        f_summaryCell(0, 2, str.tostring(horizonMins) + "分钟变化", subdued, "要求观察窗口连续有效，不跨缺报或闭市间隔。")
+        f_summaryCell(1, 2, f_signed(move) + " bp", panelFg, "观察窗口可在参数中调整。")
+        f_summaryCell(0, 3, "异常分数", subdued, "本次变化减历史均值，再除以前期波动率；不表示固定置信概率。")
+        f_summaryCell(1, 3, f_signed(zScore), liveUp or liveDn ? statusInk : panelFg, "均值 " + f_num(meanMove) + "bp / 标准差 " + f_num(sdMove) + "bp")
+        f_summaryCell(0, 4, "速度状态", subdued, "阈值与最小bp条件同时满足才触发。", statusBg)
+        f_summaryCell(1, 4, liveState, statusInk, "试运行参数需要结合历史表现校准。", statusBg, true)
+        f_summaryCell(0, 5, "法国 / 德国变化", subdued, "利差变化=法国变化-德国变化。")
+        f_summaryCell(1, 5, f_signed(frMove) + " / " + f_signed(deMove) + " bp", panelFg, "相同观察窗口，不推断新闻原因。")
+        f_summaryCell(0, 6, "收益率贡献", subdued, "两端变化的算术分类。")
+        f_summaryCell(1, 6, f_driver(frMove, deMove), panelFg, "基本不动容差 " + f_num(flatBp) + "bp")
+        f_summaryCell(0, 7, "历史实际起点", subdued, "目标起点不等于数据源实际起点。")
+        f_summaryCell(1, 7, f_date(firstDay), subdued, "已取得 " + str.tostring(dailyCount) + " 个有效日样本；可能存在缺口。")
+        f_summaryCell(0, 8, "重复提醒间隔", subdued, "实时提醒与收盘记录独立计时；历史跨度升级可另建事件。实际提醒请查看TV警报日志。")
+        f_summaryCell(1, 8, str.tostring(groupHours) + "小时", subdued, "满时不自动发送，必须有新触发；突破更早历史区间时不受间隔限制。")
+    if showLog
+        f_logCell(0, 0, "法德利差异常监控记录", themePink, recordHelp)
+        f_logCell(0, 1, "触发记录 ⓘ\n（" + closeBasis + "）", subdued, recordHelp)
+        f_logCell(1, 1, "利差 bp", subdued, "来源K线的收盘利差，不代表盘中警报当时的利差。实际值请查看TV警报日志。")
+        f_logCell(2, 1, "异常类型", subdued, "阶段新高/新低=严格越过指定日期的高低点；记录新高/新低=超过全部可用历史。描述同时列出被突破的日期与BP。")
+        f_logCell(3, 1, "触发说明", subdued, "依据已收盘K线计算的条件；盘中实际提醒以TV警报日志为准。")
+        if array.size(evKey) == 0
+            f_logCell(0, 2, dailyCount == 0 ? "等待历史数据" : "暂无异常记录", subdued, "可检查数据、周期、阈值以及最小历史跨度。")
+        else
+            int n = math.min(showCount, array.size(evKey))
+            for i = 0 to n - 1
+                int kind = array.get(evKey, i)
+                color accent = f_eventColor(kind)
+                color badgeBg = f_eventBg(kind)
+                string detail = array.get(evDescription, i)
+                array<string> lines = str.split(detail, "\n")
+                string firstLine = array.size(lines) > 0 ? array.get(lines, 0) : detail
+                string description = str.replace_all(str.replace_all(firstLine, "（合成日线高值口径）", ""), "（合成日线低值口径）", "")
+                if kind == 0 or kind == 1
+                    description := str.tostring(horizonMins) + "分钟变化 · " + (kind == 0 ? "上破波动边界" : "下破波动边界")
+                string title = array.get(evTitle, i)
+                string badge = f_eventBadge(kind, str.contains(title, "可用记录")) + (str.contains(title, "延续走势") ? " · 延续" : "")
+                int displayTime = array.get(evBarOpen, i)
+                string timeText = str.format_time(displayTime, "MM-dd HH:mm", displayZone)
+                string hint = f_eventHint(i)
+                f_logCell(0, i + 2, timeText, panelFg, hint)
+                f_logCell(1, i + 2, f_num(array.get(evLevel, i)), accent, hint, strong=true)
+                f_logCell(2, i + 2, badge, accent, hint, badgeBg, true)
+                f_logCell(3, i + 2, description, kind >= 2 ? accent : panelFg, hint, strong=kind >= 2)
+    string note = "记录" + closeBasis + "；具体盘中触发请查看警报日志。ⓘ\n历史高低值采用合成利差口径；虚线仅为缺报连接示意。"
+    table.cell(footer, 0, 0, note, text_color=subdued, text_size=size.small, text_halign=text.align_left, tooltip=recordHelp + "\n缺报虚线不参与任何数值和提醒计算，尚无后端报价时不预测。历史高代理=(法国日High-德国日Low)×100；低代理=(法国日Low-德国日High)×100，非同刻真实利差OHLC。")
+    while array.size(marks) > 0
+        label.delete(array.pop(marks))
+    if showMarks and array.size(evKey) > 0
+        int n = math.min(showCount, array.size(evKey))
+        for i = 0 to n - 1
+            int k = array.get(evKey, i)
+            bool up = k == 0 or k == 2
+            string tag = f_eventBadge(k, str.contains(array.get(evTitle, i), "可用记录"))
+            // 标记与副图表格均只表示已收盘K线的记录，不表示实际警报时刻。
+            int labelTime = array.get(evBarOpen, i)
+            string markText = tag + "\n" + str.format_time(labelTime, "MM-dd HH:mm", displayZone)
+            label mark = label.new(array.get(evBarOpen, i), array.get(evLevel, i), markText, xloc=xloc.bar_time, yloc=yloc.price, style=up ? label.style_label_down : label.style_label_up, color=f_eventBg(k), textcolor=f_eventColor(k), size=size.small, tooltip=f_eventHint(i))
+            array.push(marks, mark)
